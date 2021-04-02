@@ -18,7 +18,7 @@ exec(char *path, char **argv)
   struct elfhdr elf;
   struct inode *ip;
   struct proghdr ph;
-  pagetable_t pagetable = 0, oldpagetable;
+  pagetable_t pagetable = 0, oldpagetable, kpagetable = 0, oldkpagetable;
   struct proc *p = myproc();
 
   begin_op();
@@ -108,13 +108,21 @@ exec(char *path, char **argv)
       last = s+1;
   safestrcpy(p->name, last, sizeof(p->name));
     
+  kpagetable = uvmcreate();
+  if (kpagetable == 0 || ptcopy(pagetable, kpagetable) < 0 || ptcopykvm(kpagetable) < 0)
+    goto bad;
+    
   // Commit to the user image.
   oldpagetable = p->pagetable;
+  oldkpagetable = p->kpagetable;
   p->pagetable = pagetable;
+  p->kpagetable = kpagetable;
+  switchpt(kpagetable);
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp; // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
+  proc_freekpagetable(oldkpagetable);
 
   if(p->pid==1) vmprint(p->pagetable);
   return argc; // this ends up in a0, the first argument to main(argc, argv)
@@ -122,6 +130,8 @@ exec(char *path, char **argv)
  bad:
   if(pagetable)
     proc_freepagetable(pagetable, sz);
+  if (kpagetable)
+    proc_freekpagetable(kpagetable);
   if(ip){
     iunlockput(ip);
     end_op();

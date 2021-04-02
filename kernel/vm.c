@@ -15,6 +15,71 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+void freewalk(pagetable_t pagetable, int checkleaf);
+
+void switchpt(pagetable_t pt) {
+  w_satp(MAKE_SATP(pt));
+  sfence_vma();
+}
+
+// recuersively walk through pagetable from and insert all entry into to
+int _ptcopy(pagetable_t from, pagetable_t to, uint64 va, int level) {
+  // there are 2^9 = 512 PTEs in a page table.
+  for(int i = 0; i < 512; i++){
+    pte_t pte = from[i];
+    uint64 new_va = va | (((uint64)i) << ((level-1)*9 + 12));
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      if (_ptcopy((pagetable_t)child, to, new_va, level-1) < 0) return -1;
+    } else if(pte & PTE_V) {
+      pte_t* to_pte = walk(to, new_va, 1);
+      if (to_pte == 0) return -1;
+      *to_pte = pte & ~PTE_U;
+    }
+  }
+  return 0;
+}
+
+int ptcopy(pagetable_t from, pagetable_t to) {
+  return _ptcopy(from, to, 0, 3);  
+}
+
+int ptcopykvm(pagetable_t pt) {
+  return ptcopy(kernel_pagetable, pt);
+}
+
+void ptfree(pagetable_t pt) {
+  freewalk(pt, 0);
+}
+
+/*
+ * consider user process address space
+ * if newsz < oldsz, release relevant entries
+ * if newsz > oldsz, copy all relevant entries
+ */
+int ptsync(pagetable_t from, pagetable_t to, uint64 oldsz, uint64 newsz) {
+  uint a;
+
+  oldsz = PGROUNDUP(oldsz);
+  newsz = PGROUNDUP(newsz);
+  for (a = oldsz; a < newsz; a += PGSIZE) {
+    if (walk(from, a, 0) == 0) panic("ptsync");
+    pte_t* to_pte = walk(to, a, 1);
+    if (to_pte == 0) return -1;
+    *to_pte = *walk(from, a, 0) & ~PTE_U;
+  }
+  for (a = newsz; a < oldsz; a += PGSIZE) {
+    pte_t *pte;
+    if ((pte=walk(to, a, 0)) == 0) {
+      continue;
+      //panic("ptsync");
+    }
+    *pte = 0;
+  }
+  return 0;
+}
+
 /*
  * create a direct-map page table for the kernel.
  */
@@ -272,7 +337,7 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 // Recursively free page-table pages.
 // All leaf mappings must already have been removed.
 void
-freewalk(pagetable_t pagetable)
+freewalk(pagetable_t pagetable, int checkleaf)
 {
   // there are 2^9 = 512 PTEs in a page table.
   for(int i = 0; i < 512; i++){
@@ -280,9 +345,9 @@ freewalk(pagetable_t pagetable)
     if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
       // this PTE points to a lower-level page table.
       uint64 child = PTE2PA(pte);
-      freewalk((pagetable_t)child);
+      freewalk((pagetable_t)child, checkleaf);
       pagetable[i] = 0;
-    } else if(pte & PTE_V){
+    } else if((pte & PTE_V) && checkleaf){
       panic("freewalk: leaf");
     }
   }
@@ -296,7 +361,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 {
   if(sz > 0)
     uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
-  freewalk(pagetable);
+  freewalk(pagetable, 1);
 }
 
 // Given a parent process's page table, copy
@@ -379,23 +444,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
-
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -405,40 +454,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
-
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
-  }
+  return copyinstr_new(pagetable, dst, srcva, max);
 }
 
 static void

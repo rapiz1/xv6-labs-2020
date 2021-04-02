@@ -121,6 +121,13 @@ found:
     return 0;
   }
 
+  p->kpagetable = proc_kpagetable(p);
+  if(p->kpagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -136,11 +143,16 @@ found:
 static void
 freeproc(struct proc *p)
 {
+  // we're using p->kpagetable, so swtich to the original kernel page table before freeing
+  if (myproc() == p)
+    kvminithart();
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if (p->kpagetable)
+    proc_freekpagetable(p->kpagetable);
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -185,6 +197,16 @@ proc_pagetable(struct proc *p)
   return pagetable;
 }
 
+pagetable_t
+proc_kpagetable(struct proc *p) {
+  pagetable_t kpt = uvmcreate();
+  if (kpt == 0) return 0;
+  if (ptcopykvm(kpt) < 0) {
+    proc_freekpagetable(kpt);
+    return 0;
+  }
+  return kpt;
+}
 // Free a process's page table, and free the
 // physical memory it refers to.
 void
@@ -193,6 +215,12 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
   uvmfree(pagetable, sz);
+}
+
+void
+proc_freekpagetable(pagetable_t pagetable)
+{
+  ptfree(pagetable);
 }
 
 // a user program that calls exec("/init")
@@ -220,6 +248,16 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  ptsync(p->pagetable, p->kpagetable, 0, p->sz);
+
+/*
+  pagetable_t pt = uvmcreate();
+  vmprint(p->pagetable);
+  ptcopy(p->pagetable, pt);
+  /ptcopykvm(pt);
+  vmprint(pt);
+  panic("here");
+  */
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -242,6 +280,8 @@ growproc(int n)
   struct proc *p = myproc();
 
   sz = p->sz;
+  // can't overflow PLIC
+  if (sz + n >= 0xC000000) return -1;
   if(n > 0){
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
@@ -249,6 +289,13 @@ growproc(int n)
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
+
+  if (ptsync(p->pagetable, p->kpagetable, p->sz, sz) < 0) {
+    panic("no mem for pt");
+    ptsync(p->pagetable, p->kpagetable, sz, p->sz);
+    return -1;
+  }
+
   p->sz = sz;
   return 0;
 }
@@ -274,6 +321,12 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  if (ptsync(np->pagetable, np->kpagetable, 0, np->sz) < 0) {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   np->parent = p;
 
@@ -473,7 +526,10 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        switchpt(p->kpagetable);
         swtch(&c->context, &p->context);
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
