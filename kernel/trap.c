@@ -22,6 +22,14 @@ trapinit(void)
   initlock(&tickslock, "time");
 }
 
+static void
+pagefault_handler(void)
+{
+  if (recoverpage(r_stval()) < 0) {
+    myproc()->killed = 1;
+  }
+}
+
 // set up to take exceptions and traps while in the kernel.
 void
 trapinithart(void)
@@ -67,7 +75,11 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else {
+  } else if (r_scause() == 13 || r_scause() == 15) {
+    // page fault
+    pagefault_handler();
+  }
+  else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;
