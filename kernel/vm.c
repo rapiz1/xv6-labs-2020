@@ -6,6 +6,9 @@
 #include "defs.h"
 #include "fs.h"
 
+extern struct spinlock pa_ref_lock;
+extern int pa_ref_count[1<<20];
+
 /*
  * the kernel's page table.
  */
@@ -311,7 +314,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  //char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -320,13 +323,20 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
+    flags &= ~PTE_W;
+    flags |= PTE_RSW;
+    *pte = PA2PTE(pa) | flags;
+    /*
     if((mem = kalloc()) == 0)
       goto err;
     memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    */
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+    acquire(&pa_ref_lock);
+    pa_ref_count[(uint32)pa>>12]++;
+    release(&pa_ref_lock);
   }
   return 0;
 
@@ -348,6 +358,34 @@ uvmclear(pagetable_t pagetable, uint64 va)
   *pte &= ~PTE_U;
 }
 
+int
+recover_page(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte = walk(pagetable, va, 0);
+  if (pte == 0 || !((*pte & PTE_V) && (*pte & PTE_RSW))) {
+    printf("cant recover bad pte\n");
+    return -1;
+  }
+
+  uint64 pa = PTE2PA(*pte);
+  int flags = PTE_FLAGS(*pte);
+  flags &= ~PTE_RSW;
+  flags |= PTE_W;
+
+  char *mem = kalloc();
+  if (mem == 0) {
+    //printf("out of mem\n");
+    prockill();
+    return -1;
+  }
+  memmove(mem, (void*)pa, PGSIZE);
+
+  *pte = PA2PTE(mem) | flags;
+
+  kfree((void*)pa);
+  return 0;
+}
+
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.
@@ -361,6 +399,18 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
+
+    pte_t *pte = walk(pagetable, va0, 0);
+    if (pte == 0) panic("pte should exist");
+    if (!(*pte & PTE_W) && (*pte & PTE_RSW)) {
+      if (recover_page(pagetable, va0) < 0) {
+        prockill();
+        return -1;
+      }
+      pa0 = walkaddr(pagetable, va0);
+      if (pa0 == 0) panic("bad recover");
+    }
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
