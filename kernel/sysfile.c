@@ -304,16 +304,29 @@ sys_open(void)
       return -1;
     }
   } else {
-    if((ip = namei(path)) == 0){
-      end_op();
-      return -1;
-    }
-    ilock(ip);
-    if(ip->type == T_DIR && omode != O_RDONLY){
-      iunlockput(ip);
-      end_op();
-      return -1;
-    }
+    int depth = 0;
+    do {
+      if((ip = namei(path)) == 0){
+        end_op();
+        return -1;
+      }
+      ilock(ip);
+      if(ip->type == T_DIR && omode != O_RDONLY){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+      if (ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)) {
+        readi(ip, 0, (uint64)path, 0, MAXPATH);
+        iunlockput(ip);
+        ip = 0;
+        depth++;
+        if (depth >= 10) {
+          end_op();
+          return -1;
+        }
+      }
+    } while(!ip);
   }
 
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
@@ -483,4 +496,32 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+// Create the path new as a symbolic link to the same inode as old.
+uint64
+sys_symlink(void)
+{
+  char new[MAXPATH], old[MAXPATH];
+  int n_old;
+  if(argstr(0, old, MAXPATH) < 0 || argstr(1, new, MAXPATH) < 0)
+    return -1;
+  struct inode *ip;
+  n_old = strlen(old);
+
+  begin_op();
+  ip = create(new, T_SYMLINK, 0, 0);
+  if (ip == 0 || ip->type != T_SYMLINK) goto bad;
+
+  if (writei(ip, 0, (uint64)old, 0, n_old) != n_old) {
+    iunlockput(ip);
+    goto bad;
+  }
+    iunlockput(ip);
+  end_op();
+  return 0;
+
+  bad:
+  end_op();
+  return -1;
 }
