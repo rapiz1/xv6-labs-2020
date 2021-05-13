@@ -484,3 +484,49 @@ sys_pipe(void)
   }
   return 0;
 }
+
+uint64
+sys_mmap(void)
+{
+  uint64 addr;
+  int len, prot, flags, fd, offset;
+  struct vma vm;
+  struct proc *p;
+  
+  if (argaddr(0, &addr) < 0) // always zero in this lab
+    return -1;
+  if (argint(1, &len) < 0)
+    return -1;
+  if (argint(2, &prot) < 0)
+    return -1;
+  if (argint(3, &flags) < 0)
+    return -1;
+  if (argfd(4, &fd, &vm.f) < 0)
+    return -1;
+  if (argint(5, &offset) < 0)
+    return -1;
+  
+  p = myproc(); 
+  for (int i = 0; i < NVMA; i++) if (p->vmas[i].valid == 0) {
+    filedup(vm.f);
+    vm.start = addr; // FIXME: assign an unused address
+    vm.length = len;
+    vm.prot = prot;
+    vm.flags = flags;
+    vm.offset = offset;
+    return 0;
+  }
+  return -1;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int len;
+  if (argaddr(0, &addr) < 0)
+    return -1;
+  if (argint(1, &len) < 0)
+    return -1;
+  return -1;
+}
